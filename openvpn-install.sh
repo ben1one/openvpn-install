@@ -710,13 +710,13 @@ else
 	echo "Select an option:"
 	echo "   1) Add a new client"
 	echo "   2) Revoke an existing client"
-	echo "   3) Remove OpenVPN"
-	echo "   4) List clients and certificate expiry dates"
-	echo "   5) Show currently connected clients"
-	echo "   6) Export a client configuration"
-	echo "   7) Display a client configuration as a QR code"
-	echo "   8) Back up the server configuration"
-	echo "   9) Restore the server configuration"
+	echo "   3) List clients and certificate expiry dates"
+	echo "   4) Show currently connected clients"
+	echo "   5) Export a client configuration"
+	echo "   6) Display a client configuration as a QR code"
+	echo "   7) Back up the server configuration"
+	echo "   8) Restore the server configuration"
+	echo "   9) Uninstall OpenVPN"
 	echo "  10) Exit"
 	read -p "Option: " option
 	until [[ "$option" =~ ^([1-9]|10)$ ]]; do
@@ -791,6 +791,57 @@ else
 			exit
 		;;
 		3)
+			index=/etc/openvpn/server/easy-rsa/pki/index.txt
+			while IFS= read -r client_name; do
+				[[ -n "$client_name" && "$client_name" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
+				cert="/etc/openvpn/server/easy-rsa/pki/issued/$client_name.crt"
+				if [[ -r "$cert" ]]; then
+					printf '%s: ' "$client_name"
+					openssl x509 -in "$cert" -noout -enddate
+				else
+					echo "$client_name: certificate file unavailable"
+				fi
+			done < <(awk -F '\t' '$1 == "V" {sub(/^.*\/CN=/, "", $6); if ($6 != "server") print $6}' "$index")
+		;;
+		4)
+			status_path=$(awk '$1 == "status" {print $2; exit}' /etc/openvpn/server/server.conf)
+			if [[ -z "$status_path" ]]; then
+				echo "Status logging is not enabled for this installation. New installations enable it automatically."
+				exit 1
+			fi
+			[[ "$status_path" == /* ]] || status_path="/etc/openvpn/server/$status_path"
+			if [[ ! -r "$status_path" ]]; then
+				echo "Status file is unavailable; check that OpenVPN is running: $status_path" >&2
+				exit 1
+			fi
+			awk '/^Common Name,Real Address/ {show=1} /^ROUTING TABLE/ {show=0} show || /^CLIENT_LIST[\t,]/ {print}' "$status_path"
+		;;
+		5)
+			select_client && export_client || exit 1
+		;;
+		6)
+			if ! command -v qrencode >/dev/null 2>&1; then
+				echo "Install qrencode to display client configurations as QR codes." >&2
+				exit 1
+			fi
+			select_client || exit 1
+			if [[ ! -r /etc/openvpn/server/client-common.txt || ! -r /etc/openvpn/server/easy-rsa/pki/inline/private/$client.inline ]]; then
+				echo "Client template or private key is unavailable." >&2
+				exit 1
+			fi
+			echo "This QR code contains the client's private key. Keep it private."
+			if ! (set -o pipefail; grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline | qrencode -t ANSIUTF8); then
+				echo "QR generation failed; the profile may be too large for a QR code. Export the file instead." >&2
+				exit 1
+			fi
+		;;
+		7)
+			backup_server || exit 1
+		;;
+		8)
+			restore_server || exit 1
+		;;
+		9)
 			echo
 			read -p "Confirm OpenVPN removal? [y/N]: " remove
 			until [[ "$remove" =~ ^[yYnN]*$ ]]; do
@@ -854,57 +905,6 @@ else
 				echo "OpenVPN removal aborted!"
 			fi
 			exit
-		;;
-		4)
-			index=/etc/openvpn/server/easy-rsa/pki/index.txt
-			while IFS= read -r client_name; do
-				[[ -n "$client_name" && "$client_name" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
-				cert="/etc/openvpn/server/easy-rsa/pki/issued/$client_name.crt"
-				if [[ -r "$cert" ]]; then
-					printf '%s: ' "$client_name"
-					openssl x509 -in "$cert" -noout -enddate
-				else
-					echo "$client_name: certificate file unavailable"
-				fi
-			done < <(awk -F '\t' '$1 == "V" {sub(/^.*\/CN=/, "", $6); if ($6 != "server") print $6}' "$index")
-		;;
-		5)
-			status_path=$(awk '$1 == "status" {print $2; exit}' /etc/openvpn/server/server.conf)
-			if [[ -z "$status_path" ]]; then
-				echo "Status logging is not enabled for this installation. New installations enable it automatically."
-				exit 1
-			fi
-			[[ "$status_path" == /* ]] || status_path="/etc/openvpn/server/$status_path"
-			if [[ ! -r "$status_path" ]]; then
-				echo "Status file is unavailable; check that OpenVPN is running: $status_path" >&2
-				exit 1
-			fi
-			awk '/^Common Name,Real Address/ {show=1} /^ROUTING TABLE/ {show=0} show || /^CLIENT_LIST[\t,]/ {print}' "$status_path"
-		;;
-		6)
-			select_client && export_client || exit 1
-		;;
-		7)
-			if ! command -v qrencode >/dev/null 2>&1; then
-				echo "Install qrencode to display client configurations as QR codes." >&2
-				exit 1
-			fi
-			select_client || exit 1
-			if [[ ! -r /etc/openvpn/server/client-common.txt || ! -r /etc/openvpn/server/easy-rsa/pki/inline/private/$client.inline ]]; then
-				echo "Client template or private key is unavailable." >&2
-				exit 1
-			fi
-			echo "This QR code contains the client's private key. Keep it private."
-			if ! (set -o pipefail; grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline | qrencode -t ANSIUTF8); then
-				echo "QR generation failed; the profile may be too large for a QR code. Export the file instead." >&2
-				exit 1
-			fi
-		;;
-		8)
-			backup_server || exit 1
-		;;
-		9)
-			restore_server || exit 1
 		;;
 		10)
 			exit
