@@ -711,13 +711,13 @@ else
 	echo "   1) Add a new client"
 	echo "   2) Revoke an existing client"
 	echo "   3) Remove OpenVPN"
-	echo "   4) Exit"
-	echo "   5) List clients and certificate expiry dates"
-	echo "   6) Show currently connected clients"
-	echo "   7) Export a client configuration"
-	echo "   8) Display a client configuration as a QR code"
-	echo "   9) Back up the server configuration"
-	echo "  10) Restore the server configuration"
+	echo "   4) List clients and certificate expiry dates"
+	echo "   5) Show currently connected clients"
+	echo "   6) Export a client configuration"
+	echo "   7) Display a client configuration as a QR code"
+	echo "   8) Back up the server configuration"
+	echo "   9) Restore the server configuration"
+	echo "  10) Exit"
 	read -p "Option: " option
 	until [[ "$option" =~ ^([1-9]|10)$ ]]; do
 		echo "$option: invalid selection."
@@ -855,7 +855,7 @@ else
 			fi
 			exit
 		;;
-		5)
+		4)
 			index=/etc/openvpn/server/easy-rsa/pki/index.txt
 			while IFS= read -r client_name; do
 				[[ -n "$client_name" && "$client_name" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
@@ -868,7 +868,7 @@ else
 				fi
 			done < <(awk -F '\t' '$1 == "V" {sub(/^.*\/CN=/, "", $6); if ($6 != "server") print $6}' "$index")
 		;;
-		6)
+		5)
 			status_path=$(awk '$1 == "status" {print $2; exit}' /etc/openvpn/server/server.conf)
 			if [[ -z "$status_path" ]]; then
 				echo "Status logging is not enabled for this installation. New installations enable it automatically."
@@ -881,10 +881,10 @@ else
 			fi
 			awk '/^Common Name,Real Address/ {show=1} /^ROUTING TABLE/ {show=0} show || /^CLIENT_LIST[\t,]/ {print}' "$status_path"
 		;;
-		7)
+		6)
 			select_client && export_client || exit 1
 		;;
-		8)
+		7)
 			if ! command -v qrencode >/dev/null 2>&1; then
 				echo "Install qrencode to display client configurations as QR codes." >&2
 				exit 1
@@ -900,13 +900,13 @@ else
 				exit 1
 			fi
 		;;
-		9)
+		8)
 			backup_server || exit 1
 		;;
-		10)
+		9)
 			restore_server || exit 1
 		;;
-		4)
+		10)
 			exit
 		;;
 	esac
