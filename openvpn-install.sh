@@ -83,6 +83,61 @@ fi
 # Store the absolute path of the directory where the script is located
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+# Easy-RSA prompts directly for the passphrase; it is never stored in this script.
+build_client() {
+	local protect
+	read -r -p "Protect the client private key with a passphrase? [y/N]: " protect || return 1
+	until [[ "$protect" =~ ^[yYnN]?$ ]]; do
+		echo "Invalid selection."
+		read -r -p "Protect the client private key with a passphrase? [y/N]: " protect || return 1
+	done
+	if [[ "$protect" =~ ^[yY]$ ]]; then
+		echo "Enter and confirm the client key passphrase when prompted."
+		./easyrsa --batch --days=3650 build-client-full "$client"
+	else
+		./easyrsa --batch --days=3650 build-client-full "$client" nopass
+	fi
+}
+
+# Convert an IPv4 CIDR network into an OpenVPN route and netmask.
+cidr_to_route() {
+	local cidr=$1 addr prefix a b c d value mask network
+	[[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+	a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+	c=$((10#${BASH_REMATCH[3]})); d=$((10#${BASH_REMATCH[4]})); prefix=$((10#${BASH_REMATCH[5]}))
+	(( a <= 255 && b <= 255 && c <= 255 && d <= 255 && prefix >= 1 && prefix <= 32 )) || return 1
+	value=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+	mask=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
+	network=$(( value & mask ))
+	(( value == network )) || return 1
+	printf 'push "route %d.%d.%d.%d %d.%d.%d.%d"\n' "$a" "$b" "$c" "$d" "$((mask >> 24 & 255))" "$((mask >> 16 & 255))" "$((mask >> 8 & 255))" "$((mask & 255))"
+}
+
+export_client() {
+	local output_dir output_file
+	read -r -p "Output directory [$script_dir]: " output_dir || return 1
+	output_dir=${output_dir:-$script_dir}
+	[[ -d "$output_dir" ]] || { echo "Directory does not exist: $output_dir" >&2; return 1; }
+	output_file="$output_dir/$client.ovpn"
+	[[ ! -e "$output_file" ]] || { echo "File already exists: $output_file" >&2; return 1; }
+	[[ -r /etc/openvpn/server/client-common.txt && -r /etc/openvpn/server/easy-rsa/pki/inline/private/$client.inline ]] || {
+		echo "Client template or private key is unavailable." >&2; return 1;
+	}
+	(umask 077; set -o noclobber; grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$output_file") || return 1
+	echo "Client configuration saved to: $output_file"
+}
+
+select_client() {
+	local names
+	names=$(awk -F '\t' '$1 == "V" {sub(/^.*\/CN=/, "", $6); if ($6 != "server") print $6}' /etc/openvpn/server/easy-rsa/pki/index.txt)
+	[[ -n "$names" ]] || { echo "No active client certificates found."; return 1; }
+	echo "$names" | nl -s ') '
+	read -r -p "Client number: " client_number || return 1
+	[[ "$client_number" =~ ^[1-9][0-9]*$ ]] && (( client_number <= $(printf '%s\n' "$names" | wc -l) )) || { echo "Invalid selection." >&2; return 1; }
+	client=$(printf '%s\n' "$names" | sed -n "${client_number}p")
+	[[ "$client" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+}
+
 if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	# Detect some Debian minimal setups where neither wget nor curl are installed
 	if ! hash wget 2>/dev/null && ! hash curl 2>/dev/null; then
@@ -205,6 +260,33 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 		done
 	fi
 	echo
+	echo "Which client traffic should use the VPN?"
+	echo "   1) All traffic (default)"
+	echo "   2) Only specified IPv4 networks (split tunnelling)"
+	read -r -p "Traffic mode [1]: " traffic_mode || exit 1
+	until [[ "$traffic_mode" =~ ^[12]?$ ]]; do
+		read -r -p "Choose 1 or 2: " traffic_mode || exit 1
+	done
+	if [[ "$traffic_mode" == 2 ]]; then
+		echo "Enter IPv4 networks in CIDR notation, separated by spaces (for example 192.168.10.0/24)."
+		while :; do
+			read -r -p "Networks: " route_input || exit 1
+			split_routes=""
+			routes_valid=1
+			for cidr in $route_input; do
+				if route_line=$(cidr_to_route "$cidr"); then
+					split_routes+="$route_line"$'\n'
+				else
+					echo "Invalid network: $cidr (use a network address and prefix 1-32)."
+					routes_valid=0
+				fi
+			done
+			[[ -n "$split_routes" && "$routes_valid" == 1 ]] && break
+			echo "Please enter one or more valid networks."
+		done
+		echo "Other IPv4 and IPv6 traffic will use the client's normal routes; DNS settings may still be pushed."
+	fi
+	echo
 	echo "Enter a name for the first client:"
 	read -p "Name [client]: " unsanitized_client
 	# Allow a limited set of characters to avoid conflicts
@@ -268,7 +350,10 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 	ln -s /etc/openvpn/server/dh.pem pki/dh.pem
 	# Create certificates and CRL
 	./easyrsa --batch --days=3650 build-server-full server nopass
-	./easyrsa --batch --days=3650 build-client-full "$client" nopass
+	if ! build_client; then
+		echo "Client certificate generation failed; installation stopped." >&2
+		exit 1
+	fi
 	./easyrsa --batch --days=3650 gen-crl
 	# Move the stuff we need
 	cp pki/ca.crt pki/private/ca.key pki/issued/server.crt pki/private/server.key pki/crl.pem /etc/openvpn/server
@@ -287,17 +372,26 @@ cert server.crt
 key server.key
 dh dh.pem
 auth SHA512
+data-ciphers AES-256-GCM:AES-128-GCM
+tls-version-min 1.2
 tls-crypt tc.key
 topology subnet
 server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
 	# IPv6
-	if [[ -z "$ip6" ]]; then
-		echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
-	else
+	if [[ -n "$ip6" ]]; then
 		echo 'server-ipv6 fddd:1194:1194:1194::/64' >> /etc/openvpn/server/server.conf
-		echo 'push "redirect-gateway def1 ipv6 bypass-dhcp"' >> /etc/openvpn/server/server.conf
 	fi
-	echo 'ifconfig-pool-persist ipp.txt' >> /etc/openvpn/server/server.conf
+	if [[ "$traffic_mode" == 2 ]]; then
+		printf '%s' "$split_routes" >> /etc/openvpn/server/server.conf
+	elif [[ -n "$ip6" ]]; then
+		echo 'push "redirect-gateway def1 ipv6 bypass-dhcp"' >> /etc/openvpn/server/server.conf
+	else
+		echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
+	fi
+	# Only the lease database needs to be writable by the sandboxed service.
+	install -d -m 700 -o nobody -g "$group_name" /var/lib/openvpn-install
+	echo 'ifconfig-pool-persist /var/lib/openvpn-install/ipp.txt' >> /etc/openvpn/server/server.conf
+	echo 'status /var/lib/openvpn-install/status.log 10' >> /etc/openvpn/server/server.conf
 	# DNS
 	case "$dns" in
 		1|"")
@@ -439,16 +533,33 @@ persist-key
 persist-tun
 remote-cert-tls server
 auth SHA512
+data-ciphers AES-256-GCM:AES-128-GCM
+tls-version-min 1.2
 ignore-unknown-option block-outside-dns
 verb 3" > /etc/openvpn/server/client-common.txt
+	# Keep system files read-only while allowing OpenVPN to persist client leases.
+	mkdir -p /etc/systemd/system/openvpn-server@server.service.d
+	cat > /etc/systemd/system/openvpn-server@server.service.d/openvpn-install-hardening.conf <<'EOF'
+[Service]
+ProtectSystem=strict
+ReadWritePaths=/var/lib/openvpn-install
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+	systemctl daemon-reload
 	# Enable and start the OpenVPN service
-	systemctl enable --now openvpn-server@server.service
+	if ! systemctl enable --now openvpn-server@server.service; then
+		echo "OpenVPN failed to start. Check: systemctl status openvpn-server@server.service" >&2
+		exit 1
+	fi
 	# Build the $client.ovpn file, stripping comments from easy-rsa in the process
-	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+	if ! export_client; then
+		echo "Client created, but export failed. Use the client management menu to export it." >&2
+		exit 1
+	fi
 	echo
 	echo "Finished!"
 	echo
-	echo "The client configuration is available in:" "$script_dir"/"$client.ovpn"
 	echo "New clients can be added by running this script again."
 else
 	clear
@@ -459,8 +570,12 @@ else
 	echo "   2) Revoke an existing client"
 	echo "   3) Remove OpenVPN"
 	echo "   4) Exit"
+	echo "   5) List clients and certificate expiry dates"
+	echo "   6) Show currently connected clients"
+	echo "   7) Export a client configuration"
+	echo "   8) Display a client configuration as a QR code"
 	read -p "Option: " option
-	until [[ "$option" =~ ^[1-4]$ ]]; do
+	until [[ "$option" =~ ^[1-8]$ ]]; do
 		echo "$option: invalid selection."
 		read -p "Option: " option
 	done
@@ -476,11 +591,17 @@ else
 				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 			done
 			cd /etc/openvpn/server/easy-rsa/
-			./easyrsa --batch --days=3650 build-client-full "$client" nopass
+			if ! build_client; then
+				echo "Client certificate generation failed." >&2
+				exit 1
+			fi
 			# Build the $client.ovpn file, stripping comments from easy-rsa in the process
-			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+			if ! export_client; then
+				echo "Client created, but export failed. Use the client management menu to export it." >&2
+				exit 1
+			fi
 			echo
-			echo "$client added. Configuration available in:" "$script_dir"/"$client.ovpn"
+			echo "$client added."
 			exit
 		;;
 		2)
@@ -560,6 +681,9 @@ else
 				fi
 				systemctl disable --now openvpn-server@server.service
 				rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
+				rm -f /etc/systemd/system/openvpn-server@server.service.d/openvpn-install-hardening.conf
+				rm -rf /var/lib/openvpn-install
+				systemctl daemon-reload
 				rm -f /etc/sysctl.d/99-openvpn-forward.conf
 				if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
 					rm -rf /etc/openvpn/server
@@ -576,6 +700,51 @@ else
 				echo "OpenVPN removal aborted!"
 			fi
 			exit
+		;;
+		5)
+			index=/etc/openvpn/server/easy-rsa/pki/index.txt
+			while IFS= read -r client_name; do
+				[[ -n "$client_name" && "$client_name" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
+				cert="/etc/openvpn/server/easy-rsa/pki/issued/$client_name.crt"
+				if [[ -r "$cert" ]]; then
+					printf '%s: ' "$client_name"
+					openssl x509 -in "$cert" -noout -enddate
+				else
+					echo "$client_name: certificate file unavailable"
+				fi
+			done < <(awk -F '\t' '$1 == "V" {sub(/^.*\/CN=/, "", $6); if ($6 != "server") print $6}' "$index")
+		;;
+		6)
+			status_path=$(awk '$1 == "status" {print $2; exit}' /etc/openvpn/server/server.conf)
+			if [[ -z "$status_path" ]]; then
+				echo "Status logging is not enabled for this installation. New installations enable it automatically."
+				exit 1
+			fi
+			[[ "$status_path" == /* ]] || status_path="/etc/openvpn/server/$status_path"
+			if [[ ! -r "$status_path" ]]; then
+				echo "Status file is unavailable; check that OpenVPN is running: $status_path" >&2
+				exit 1
+			fi
+			awk '/^Common Name,Real Address/ {show=1} /^ROUTING TABLE/ {show=0} show || /^CLIENT_LIST[\t,]/ {print}' "$status_path"
+		;;
+		7)
+			select_client && export_client || exit 1
+		;;
+		8)
+			if ! command -v qrencode >/dev/null 2>&1; then
+				echo "Install qrencode to display client configurations as QR codes." >&2
+				exit 1
+			fi
+			select_client || exit 1
+			if [[ ! -r /etc/openvpn/server/client-common.txt || ! -r /etc/openvpn/server/easy-rsa/pki/inline/private/$client.inline ]]; then
+				echo "Client template or private key is unavailable." >&2
+				exit 1
+			fi
+			echo "This QR code contains the client's private key. Keep it private."
+			if ! (set -o pipefail; grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline | qrencode -t ANSIUTF8); then
+				echo "QR generation failed; the profile may be too large for a QR code. Export the file instead." >&2
+				exit 1
+			fi
 		;;
 		4)
 			exit
