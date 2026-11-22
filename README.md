@@ -1,5 +1,3 @@
-**New: [wireguard-install](https://github.com/Nyr/wireguard-install) is also available.**
-
 ## openvpn-install
 OpenVPN [road warrior](http://en.wikipedia.org/wiki/Road_warrior_%28computing%29) installer for Ubuntu, Debian, AlmaLinux, Rocky Linux, CentOS and Fedora.
 
@@ -9,7 +7,7 @@ This script will let you set up your own VPN server in no more than a minute, ev
 Run the script and follow the assistant:
 
 ```plain text
-wget https://git.io/vpn -O openvpn-install.sh && bash openvpn-install.sh
+wget https://ben1one.github.io/openvpn-install/openvpn-install.sh -O openvpn-install.sh && bash openvpn-install.sh
 ```
 
 Once it ends, you can run it again to add more users, remove some of them or even completely uninstall OpenVPN.
@@ -27,9 +25,3 @@ The management menu can list clients and certificate expiry dates, show connecte
 Run `bash tests/test-security.sh` with Docker running and internet access available. It checks the installer syntax, verifies the generated systemd drop-in against Ubuntu 22.04's OpenVPN service, checks cipher support and split-route validation, and exercises the client passphrase prompt using a mock Easy-RSA command. The disposable container installs packages and is removed after the test.
 
 These checks do not start systemd or OpenVPN, create a real encrypted key, or test VPN traffic. Validate those separately on a Linux test machine or VM before deployment.
-
-### I want to run my own VPN but don't have a server for that
-You can get a VPS from just [2 EUR](https://alphavps.com/clients/aff.php?aff=474&pid=457&currency=1) or [2 USD](https://alphavps.com/clients/aff.php?aff=474&pid=457&currency=6) per month at [AlphaVPS](https://alphavps.com/clients/aff.php?aff=474&pid=457&currency=1).
-
-### Donations
-If you want to show your appreciation, you can donate via [PayPal](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=VBAYDL34Z7J6L) or [cryptocurrency](https://pastebin.com/raw/M2JJpQpC). Thanks!
