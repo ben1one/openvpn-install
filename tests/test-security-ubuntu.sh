@@ -4,7 +4,7 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends systemd openvpn >/tmp/test-install.log 2>&1 || {
+apt-get install -y -qq --no-install-recommends systemd openvpn openssl python3 >/tmp/test-install.log 2>&1 || {
 	cat /tmp/test-install.log >&2
 	exit 1
 }
@@ -32,7 +32,9 @@ echo 'PASS: OpenVPN supports configured ciphers; server and client specify TLS s
 
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT
-awk '/^build_client\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$installer" > "$test_dir/function.sh"
+for name in read_certificate_days warn_ca_expiry build_client; do
+	awk -v start="$name() {" '$0 == start {copy=1} copy {print} copy && /^\}/ {exit}' "$installer" >> "$test_dir/function.sh"
+done
 cat > "$test_dir/easyrsa" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "$TEST_ARGS"
@@ -42,17 +44,22 @@ cd "$test_dir"
 export TEST_ARGS="$test_dir/args"
 client=alice
 source ./function.sh
-printf 'y\n' | build_client
+printf '\ny\n' | build_client
 [[ $(cat "$TEST_ARGS") == '--batch --days=3650 build-client-full alice' ]]
-printf 'n\n' | build_client
+printf '\nn\n' | build_client
 [[ $(cat "$TEST_ARGS") == '--batch --days=3650 build-client-full alice nopass' ]]
-printf 'invalid\ny\n' | build_client
-[[ $(cat "$TEST_ARGS") == '--batch --days=3650 build-client-full alice' ]]
+printf '0\n730\ninvalid\ny\n' | build_client
+[[ $(cat "$TEST_ARGS") == '--batch --days=730 build-client-full alice' ]]
 if build_client </dev/null; then
 	echo 'Unexpected success when input closes' >&2
 	exit 1
 fi
 echo 'PASS: client passphrase selection, invalid input, and EOF (mock Easy-RSA)'
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=test-ca -days 1 \
+	-keyout "$test_dir/ca.key" -out "$test_dir/ca.crt" >/dev/null 2>&1
+certificate_days=2
+[[ $(warn_ca_expiry "$test_dir/ca.crt") == *'Warning: the CA expires'* ]]
+echo 'PASS: warning when requested lifetime exceeds CA validity'
 
 awk '/^cidr_to_route\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$installer" > "$test_dir/routes.sh"
 source "$test_dir/routes.sh"
@@ -90,3 +97,52 @@ if select_client <<<'2'; then
 	exit 1
 fi
 echo 'PASS: client selection, secure export, and overwrite protection'
+
+printf 'port 1194\n' > /etc/openvpn/server/server.conf
+for name in backup_server extract_server_backup; do
+	awk -v start="$name() {" '$0 == start {copy=1} copy {print} copy && /^\}/ {exit}' "$installer" > "$test_dir/$name.sh"
+	source "$test_dir/$name.sh"
+done
+backup_server <<<''
+[[ $(stat -c '%a' "$test_dir/openvpn-backup.tar.gz") == 600 ]]
+mkdir "$test_dir/restore"
+extract_server_backup "$test_dir/openvpn-backup.tar.gz" "$test_dir/restore"
+cmp /etc/openvpn/server/server.conf "$test_dir/restore/server/server.conf"
+python3 - "$test_dir/unsafe.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as archive:
+    for name in ('server/server.conf', 'server/../../escape'):
+        info = tarfile.TarInfo(name)
+        info.size = 1
+        archive.addfile(info, io.BytesIO(b'x'))
+PY
+if extract_server_backup "$test_dir/unsafe.tar.gz" "$test_dir/restore"; then
+	echo 'Unsafe archive unexpectedly accepted' >&2
+	exit 1
+fi
+echo 'PASS: private backup, safe extraction, and archive traversal rejection'
+
+awk -v start='restore_server() {' '$0 == start {copy=1} copy {print} copy && /^\}/ {exit}' "$installer" > "$test_dir/restore_server.sh"
+source "$test_dir/restore_server.sh"
+cat > "$test_dir/systemctl" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == start && -e "$FAIL_ONCE" ]]; then
+	rm -f "$FAIL_ONCE"
+	exit 1
+fi
+exit 0
+EOF
+chmod +x "$test_dir/systemctl"
+export PATH="$test_dir:$PATH" FAIL_ONCE="$test_dir/fail-once"
+group_name=nogroup
+printf 'port 443\n' > /etc/openvpn/server/server.conf
+printf '%s\nRESTORE\n' "$test_dir/openvpn-backup.tar.gz" | restore_server
+grep -Fxq 'port 1194' /etc/openvpn/server/server.conf
+printf 'port 443\n' > /etc/openvpn/server/server.conf
+touch "$FAIL_ONCE"
+if printf '%s\nRESTORE\n' "$test_dir/openvpn-backup.tar.gz" | restore_server; then
+	echo 'Restore unexpectedly succeeded after a simulated service failure' >&2
+	exit 1
+fi
+grep -Fxq 'port 443' /etc/openvpn/server/server.conf
+echo 'PASS: restore and rollback after simulated service failure'

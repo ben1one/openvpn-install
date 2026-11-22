@@ -100,9 +100,31 @@ fi
 # Store the absolute path of the directory where the script is located
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+# Set the validity for each certificate independently. The CA and CRL have
+# separate lifetimes and may expire before a certificate issued by the CA.
+read_certificate_days() {
+	local input
+	read -r -p "Certificate validity in days [3650, about 10 years]: " input || return 1
+	until [[ -z "$input" || "$input" =~ ^[1-9][0-9]{0,4}$ && "$input" -le 36500 ]]; do
+		echo "Enter a number of days from 1 to 36500."
+		read -r -p "Certificate validity in days [3650]: " input || return 1
+	done
+	certificate_days=${input:-3650}
+}
+
+warn_ca_expiry() {
+	local ca_file=$1
+	if [[ -r "$ca_file" ]] && ! openssl x509 -in "$ca_file" -noout -checkend "$((certificate_days * 86400))" >/dev/null 2>&1; then
+		echo "Warning: the CA expires before this certificate's requested lifetime."
+		echo "The certificate will stop being trusted when the CA expires unless the CA is renewed."
+	fi
+}
+
 # Easy-RSA prompts directly for the passphrase; it is never stored in this script.
 build_client() {
 	local protect
+	read_certificate_days || return 1
+	warn_ca_expiry pki/ca.crt
 	read -r -p "Protect the client private key with a passphrase? [y/N]: " protect || return 1
 	until [[ "$protect" =~ ^[yYnN]?$ ]]; do
 		echo "Invalid selection."
@@ -110,9 +132,9 @@ build_client() {
 	done
 	if [[ "$protect" =~ ^[yY]$ ]]; then
 		echo "Enter and confirm the client key passphrase when prompted."
-		./easyrsa --batch --days=3650 build-client-full "$client"
+		./easyrsa --batch --days="$certificate_days" build-client-full "$client"
 	else
-		./easyrsa --batch --days=3650 build-client-full "$client" nopass
+		./easyrsa --batch --days="$certificate_days" build-client-full "$client" nopass
 	fi
 }
 
@@ -135,13 +157,100 @@ export_client() {
 	read -r -p "Output directory [$script_dir]: " output_dir || return 1
 	output_dir=${output_dir:-$script_dir}
 	[[ -d "$output_dir" ]] || { echo "Directory does not exist: $output_dir" >&2; return 1; }
+	output_dir=$(cd "$output_dir" && pwd -P) || return 1
+	[[ "$output_dir" != *$'\n'* ]] || { echo "Newlines in output paths are not supported." >&2; return 1; }
 	output_file="$output_dir/$client.ovpn"
 	[[ ! -e "$output_file" ]] || { echo "File already exists: $output_file" >&2; return 1; }
 	[[ -r /etc/openvpn/server/client-common.txt && -r /etc/openvpn/server/easy-rsa/pki/inline/private/$client.inline ]] || {
 		echo "Client template or private key is unavailable." >&2; return 1;
 	}
 	(umask 077; set -o noclobber; grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$output_file") || return 1
+	(umask 077; printf '%s\n' "$output_file" >> /etc/openvpn/server/exported-profiles.list) || echo "Warning: could not record the exported profile for uninstall cleanup." >&2
 	echo "Client configuration saved to: $output_file"
+}
+
+backup_server() {
+	local backup_file backup_dir backup_temp
+	read -r -p "Backup file [$script_dir/openvpn-backup.tar.gz]: " backup_file || return 1
+	backup_file=${backup_file:-$script_dir/openvpn-backup.tar.gz}
+	backup_dir=$(cd "$(dirname "$backup_file")" && pwd -P) || return 1
+	[[ "$backup_dir" != /etc/openvpn/server && "$backup_dir" != /etc/openvpn/server/* ]] || { echo "Choose a location outside the server directory." >&2; return 1; }
+	backup_file="$backup_dir/$(basename "$backup_file")"
+	[[ ! -e "$backup_file" ]] || { echo "Backup file already exists." >&2; return 1; }
+	backup_temp=$(umask 077; mktemp "$backup_dir/.openvpn-backup.XXXXXXXX") || return 1
+	if ! tar -C /etc/openvpn -czh -f "$backup_temp" server; then
+		rm -f "$backup_temp"
+		echo "Backup failed." >&2
+		return 1
+	fi
+	if ! ln "$backup_temp" "$backup_file"; then
+		rm -f "$backup_temp"
+		echo "Could not create backup file without overwriting an existing file." >&2
+		return 1
+	fi
+	rm -f "$backup_temp"
+	echo "Backup saved to $backup_file. It contains CA and client private keys; keep it secure."
+	echo "Firewall, systemd, and system network settings are not included."
+}
+
+# Reject links, special files, traversal and duplicate paths before extracting.
+extract_server_backup() {
+	python3 - "$1" "$2" <<'PY'
+import os, pathlib, sys, tarfile
+try:
+    with tarfile.open(sys.argv[1], 'r:gz') as archive:
+        members = archive.getmembers()
+        seen = set()
+        for item in members:
+            path = pathlib.PurePosixPath(item.name)
+            if (path.is_absolute() or '..' in path.parts or not path.parts or
+                path.parts[0] != 'server' or not (item.isfile() or item.isdir()) or
+                str(path) in seen):
+                raise ValueError('unsafe or duplicate archive entry: ' + item.name)
+            seen.add(str(path))
+        if 'server/server.conf' not in seen:
+            raise ValueError('server configuration missing')
+        archive.extractall(sys.argv[2], members=members)
+except (OSError, tarfile.TarError, ValueError) as error:
+    print('Invalid backup:', error, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+restore_server() {
+	local archive temp_dir confirm
+	command -v python3 >/dev/null || { echo "python3 is required to validate backups." >&2; return 1; }
+	read -r -p "Path to backup file: " archive || return 1
+	[[ -f "$archive" ]] || { echo "Backup file not found." >&2; return 1; }
+	temp_dir=$(mktemp -d /etc/openvpn/.restore.XXXXXXXX) || return 1
+	if ! extract_server_backup "$archive" "$temp_dir"; then rm -rf "$temp_dir"; return 1; fi
+	echo "Restore replaces the current server configuration and keys. Firewall and system settings are not restored."
+	read -r -p "Type RESTORE to continue: " confirm || { rm -rf "$temp_dir"; return 1; }
+	[[ "$confirm" == RESTORE ]] || { rm -rf "$temp_dir"; echo "Restore cancelled."; return 1; }
+	if ! systemctl stop openvpn-server@server.service; then rm -rf "$temp_dir"; return 1; fi
+	if ! mv /etc/openvpn/server "$temp_dir/previous"; then systemctl start openvpn-server@server.service; rm -rf "$temp_dir"; return 1; fi
+	if ! mv "$temp_dir/server" /etc/openvpn/server; then
+		mv "$temp_dir/previous" /etc/openvpn/server
+		systemctl start openvpn-server@server.service
+		rm -rf "$temp_dir"
+		return 1
+	fi
+	chown -R root:root /etc/openvpn/server
+	chmod o+x /etc/openvpn/server
+	[[ ! -e /etc/openvpn/server/crl.pem ]] || chown nobody:"$group_name" /etc/openvpn/server/crl.pem
+	if ! systemctl start openvpn-server@server.service; then
+		echo "Restored configuration failed to start; reverting to the previous configuration." >&2
+		mv /etc/openvpn/server "$temp_dir/failed"
+		mv "$temp_dir/previous" /etc/openvpn/server
+		if systemctl start openvpn-server@server.service; then
+			rm -rf "$temp_dir"
+		else
+			echo "Previous configuration also failed to start. Recovery files retained at $temp_dir." >&2
+		fi
+		return 1
+	fi
+	rm -rf "$temp_dir"
+	echo "Server configuration restored. Re-export client profiles if needed."
 }
 
 select_client() {
@@ -212,6 +321,16 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 		done
 		[[ -z "$ip6_number" ]] && ip6_number="1"
 		ip6=$(ip -6 addr | grep 'inet6 [23]' | cut -d '/' -f 1 | grep -oE '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}' | sed -n "$ip6_number"p)
+	fi
+	if [[ -n "$ip6" ]]; then
+		echo
+		read -r -p "Enable IPv6 VPN routing? [Y/n]: " ipv6_choice || exit 1
+		until [[ "$ipv6_choice" =~ ^[yYnN]?$ ]]; do
+			read -r -p "Enable IPv6 VPN routing? [Y/n]: " ipv6_choice || exit 1
+		done
+		[[ "$ipv6_choice" =~ ^[nN]$ ]] && ip6=""
+	else
+		echo "No global IPv6 address detected; IPv6 VPN routing will be disabled."
 	fi
 	echo
 	echo "Which protocol should OpenVPN use?"
@@ -310,6 +429,10 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 	[[ -z "$client" ]] && client="client"
 	echo
+	echo "Set the server certificate lifetime. The CA has a separate default lifetime of about 10 years."
+	read_certificate_days || exit 1
+	server_certificate_days=$certificate_days
+	echo
 	echo "OpenVPN installation is ready to begin."
 	# Install a firewall if firewalld or iptables are not already available
 	if ! systemctl is-active --quiet firewalld.service && ! hash iptables 2>/dev/null; then
@@ -366,7 +489,9 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 	# Make easy-rsa aware of our external DH file (prevents a warning)
 	ln -s /etc/openvpn/server/dh.pem pki/dh.pem
 	# Create certificates and CRL
-	./easyrsa --batch --days=3650 build-server-full server nopass
+	certificate_days=$server_certificate_days
+	warn_ca_expiry pki/ca.crt
+	./easyrsa --batch --days="$server_certificate_days" build-server-full server nopass
 	if ! build_client; then
 		echo "Client certificate generation failed; installation stopped." >&2
 		exit 1
@@ -591,8 +716,10 @@ else
 	echo "   6) Show currently connected clients"
 	echo "   7) Export a client configuration"
 	echo "   8) Display a client configuration as a QR code"
+	echo "   9) Back up the server configuration"
+	echo "  10) Restore the server configuration"
 	read -p "Option: " option
-	until [[ "$option" =~ ^[1-8]$ ]]; do
+	until [[ "$option" =~ ^([1-9]|10)$ ]]; do
 		echo "$option: invalid selection."
 		read -p "Option: " option
 	done
@@ -671,6 +798,16 @@ else
 				read -p "Confirm OpenVPN removal? [y/N]: " remove
 			done
 			if [[ "$remove" =~ ^[yY]$ ]]; then
+				if [[ -s /etc/openvpn/server/exported-profiles.list ]]; then
+					echo "Previously exported client profiles:"
+					cat /etc/openvpn/server/exported-profiles.list
+					read -r -p "Remove these files too? [y/N]: " remove_profiles
+					if [[ "$remove_profiles" =~ ^[yY]$ ]]; then
+						while IFS= read -r profile; do
+							[[ "$profile" == /*.ovpn && -f "$profile" && ! -L "$profile" ]] && rm -f -- "$profile"
+						done < /etc/openvpn/server/exported-profiles.list
+					fi
+				fi
 				port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				if systemctl is-active --quiet firewalld.service; then
@@ -762,6 +899,12 @@ else
 				echo "QR generation failed; the profile may be too large for a QR code. Export the file instead." >&2
 				exit 1
 			fi
+		;;
+		9)
+			backup_server || exit 1
+		;;
+		10)
+			restore_server || exit 1
 		;;
 		4)
 			exit

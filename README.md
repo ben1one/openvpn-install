@@ -16,11 +16,17 @@ Once it ends, you can run it again to add more users, remove some of them or eve
 
 For new installations, the server and generated client profiles require TLS 1.2 or newer and negotiate AES-256-GCM or AES-128-GCM. Client software must support OpenVPN 2.5 or newer and a matching cipher. During installation and when adding a client, you can choose to protect that client's private key with a passphrase; the client will need it when connecting. Keep all client profiles private, even when their keys are encrypted.
 
+Choose the server certificate's validity when installing, and each client certificate's validity when creating that client. The default is 3650 days (about 10 years); values from 1 to 36500 days are accepted. Certificates cannot be made non-expiring. The CA certificate and certificate revocation list (CRL) have independent expiration dates: the installer warns when a requested certificate lifetime exceeds the CA's remaining validity, and an expired CA or CRL can prevent connections. This option does not renew existing certificates, the CA, or the CRL.
+
 New installations also use a systemd service sandbox. Its writable lease database is stored in `/var/lib/openvpn-install`, and is removed when uninstalling. Existing installations are not automatically reconfigured; newly added clients continue to use their existing server's client template.
 
 During a new installation, choose full-tunnel routing or split tunnelling with one or more IPv4 network addresses in CIDR notation (for example, `192.168.10.0/24`). In split mode, only those routes and the VPN's own subnet are added; other traffic follows the client's existing routes. IPv6 routes are not pushed in split mode. DNS settings are still pushed and client behavior depends on its OpenVPN software. The VPN server and any destination networks must have suitable forwarding and return routes. Existing installations retain their routing configuration.
 
 The management menu can list clients and certificate expiry dates, show connected clients, export an existing client profile to a chosen existing directory, and display a profile as a QR code when `qrencode` is installed. Profiles contain private keys: transfer them securely. Some profiles exceed the QR format's capacity; export the file instead. Connection status requires an OpenVPN `status` directive; new installations configure it automatically. Existing installations without status logging need it configured separately.
+
+When a public IPv6 address is detected, new installations let you disable IPv6 VPN routing; IPv6 forwarding and firewall rules are only configured when it is enabled. Existing installations are unchanged.
+
+The management menu can back up and restore `/etc/openvpn/server` on an existing installation. Backups contain private keys and are created with owner-only permissions; keep them secure. Restore validates the archive, asks for confirmation, and attempts to revert if the restored service fails to start. Firewall rules, systemd settings, network settings, and the lease database are not included, so this is not a complete machine migration. Restore requires Python 3. Uninstall removes the server's EasyRSA directory and offers to delete recorded exported profiles; profiles created before this feature or moved afterwards must be removed manually.
 
 ### Security checks
 
